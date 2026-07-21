@@ -6,6 +6,7 @@ const items = [{ id: "xl-tshirt", amount: 1000 }];
 
 let elements;
 
+// Initialize the elements right away
 initialize();
 
 document
@@ -14,28 +15,51 @@ document
 
 // Fetches a payment intent and captures the client secret
 async function initialize() {
-  const response = await fetch("/create-payment-intent", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items }),
-  });
-  const { clientSecret } = await response.json();
+  try {
+    // Note: Make sure the URL matches your Go backend's route mapping
+    const response = await fetch("/create-payment-intent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items }),
+    });
 
-  const appearance = {
-    theme: 'stripe',
-  };
-  elements = stripe.elements({ appearance, clientSecret });
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
 
-  const paymentElementOptions = {
-    layout: "accordion",
-  };
+    const { clientSecret } = await response.json();
 
-  const paymentElement = elements.create("payment", paymentElementOptions);
-  paymentElement.mount("#payment-element");
+    const appearance = {
+      theme: 'stripe',
+    };
+    
+    // Create elements instance with the client secret
+    elements = stripe.elements({ appearance, clientSecret });
+
+    const paymentElementOptions = {
+      layout: "accordion",
+    };
+
+    // Create and mount the payment element
+    const paymentElement = elements.create("payment", paymentElementOptions);
+    paymentElement.mount("#payment-element");
+    
+  } catch (error) {
+    console.error("Initialization failed:", error);
+    showMessage("Failed to initialize the payment system. Please try again later.");
+  }
 }
 
 async function handleSubmit(e) {
   e.preventDefault();
+
+  // GUARD: Prevent submission if elements haven't loaded yet
+  // This specifically fixes the "elements should have a mounted Payment Element" error
+  if (!stripe || !elements) {
+    showMessage("Payment form is still loading. Please wait.");
+    return;
+  }
+
   setLoading(true);
 
   const { error } = await stripe.confirmPayment({
@@ -47,10 +71,7 @@ async function handleSubmit(e) {
   });
 
   // This point will only be reached if there is an immediate error when
-  // confirming the payment. Otherwise, your customer will be redirected to
-  // your `return_url`. For some payment methods like iDEAL, your customer will
-  // be redirected to an intermediate site first to authorize the payment, then
-  // redirected to the `return_url`.
+  // confirming the payment.
   if (error.type === "card_error" || error.type === "validation_error") {
     showMessage(error.message);
   } else {
@@ -61,10 +82,8 @@ async function handleSubmit(e) {
 }
 
 // ------- UI helpers -------
-
 function showMessage(messageText) {
   const messageContainer = document.querySelector("#payment-message");
-
   messageContainer.classList.remove("hidden");
   messageContainer.textContent = messageText;
 }
