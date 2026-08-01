@@ -125,7 +125,7 @@ func (li *LineItemsCheckoutSessionParams) MappingLICheckoutSessionParams() (*str
 	}
 
 	// support save shipping address
-	if li.BillingAddressCollect != nil && *li.BillingAddressCollect == true {
+	if li.ShippingAddressCollect != nil && *li.ShippingAddressCollect == true {
 		params.ShippingAddressCollection = &stripe.CheckoutSessionCreateShippingAddressCollectionParams{
 			AllowedCountries: []*string{
 				stripe.String("US"),

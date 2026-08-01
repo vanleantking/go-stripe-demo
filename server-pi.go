@@ -95,7 +95,7 @@ func handleCreatePaymentIntent(service stripeaym.PII, w http.ResponseWriter, r *
 			City:       "hcmut",
 			PostalCode: "70000",
 		},
-		OrderID: "nwa-521",
+		OrderID: "sunway-008",
 	}
 	pi, err := service.MakePaymentIntents(&params)
 	if err != nil {

@@ -62,7 +62,7 @@ func (h *StripeWebhookHandler) ServeHTTP(w http.ResponseWriter, req *http.Reques
 			return
 		}
 
-		h.handlePaymentSuccess(pi)
+		// h.handlePaymentSuccess(pi)
 		h.publishPaymentSuccess(ctx, pi.Metadata["order_id"], pi.ID, pi.Amount, "payment_intent")
 
 	case WEBHOOK_PAYMENT_INTENT_FAILED:
@@ -79,9 +79,15 @@ func (h *StripeWebhookHandler) ServeHTTP(w http.ResponseWriter, req *http.Reques
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		// Access the metadata directly on the session!
+		orderID := session.Metadata["order_id"]
+		if orderID == "" {
+			log.Println("Critical: checkout.session.completed missing order_id metadata")
+			return
+		}
 
 		// h.handleCOSuccess(session)
-		h.publishPaymentSuccess(ctx, session.Metadata["order_id"], session.ID, session.AmountTotal, "checkout_session")
+		h.publishPaymentSuccess(ctx, orderID, session.ID, session.AmountTotal, "checkout_session")
 
 	default:
 		// Unhandled event type

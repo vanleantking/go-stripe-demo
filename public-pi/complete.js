@@ -65,7 +65,7 @@ function setErrorState() {
 }
 
 // Stripe.js instance
-const stripe = Stripe("pk_test_dYxARN1KXc7Tu1SMTz0IsA8a");
+const stripe = Stripe("pk_test_51Tz2LMCvcNWHm20M5LrvI4De2IYchyT1whxYj2wdVvS2rpq0WJO5fBkLBPIs4QTtn8MA44v3qkeLNJY9G4QJzX3I00QV4ho05P");
 
 checkStatus();
 
