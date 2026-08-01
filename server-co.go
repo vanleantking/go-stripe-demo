@@ -87,7 +87,7 @@ func createCOSessionFromService(
 		Currency:               "vnd",
 		BillingAddressCollect:  &collectInfo,
 		ShippingAddressCollect: &collectInfo,
-		OrderID:                "123-qwae",
+		OrderID:                "sunwa-co-001",
 		TotalCost:              &totalCost,
 	}
 	checkoutURL, er := sc.MakeCheckoutSessions(
