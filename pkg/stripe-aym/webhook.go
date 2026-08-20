@@ -3,21 +3,15 @@ package stripeaym
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stripe/stripe-go/v86"
 	"github.com/stripe/stripe-go/v86/webhook"
-)
-
-const (
-	WEBHOOK_PAYMENT_INTENT_SUCCESS     = "payment_intent.succeeded"
-	WEBHOOK_PAYMENT_INTENT_FAILED      = "payment_intent.payment_failed"
-	WEBHOOK_CHECKOUT_SESSION_COMPLETED = "checkout.session.completed"
-
-	RedisOrderChannel = "channel:order:events"
 )
 
 type StripeWebhookHandler struct {
@@ -33,8 +27,12 @@ func NewStripeWebhookHandler(secret string, rdb *redis.Client) *StripeWebhookHan
 }
 
 func (h *StripeWebhookHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	const MaxBodyBytes = int64(65536)
-	req.Body = http.MaxBytesReader(w, req.Body, MaxBodyBytes)
+	if req.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	req.Body = http.MaxBytesReader(w, req.Body, MAX_BODY_BYTES_WEBHOOK)
 	payload, err := io.ReadAll(req.Body)
 	if err != nil {
 		http.Error(w, "Error reading request body", http.StatusServiceUnavailable)
@@ -49,132 +47,197 @@ func (h *StripeWebhookHandler) ServeHTTP(w http.ResponseWriter, req *http.Reques
 		http.Error(w, "Invalid signature", http.StatusBadRequest)
 		return
 	}
-	ctx := req.Context()
+	ctx, cancel := context.WithTimeout(req.Context(), 4*time.Second)
+	defer cancel()
 
-	// 2. Handle the Event Type
-	switch event.Type {
-	case WEBHOOK_PAYMENT_INTENT_SUCCESS:
-		var pi stripe.PaymentIntent
-		err := json.Unmarshal(event.Data.Raw, &pi)
-		if err != nil {
-			log.Printf("Error parsing webhook JSON: %v\n", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		// h.handlePaymentSuccess(pi)
-		h.publishPaymentSuccess(ctx, pi.Metadata["order_id"], pi.ID, pi.Amount, "payment_intent")
-
-	case WEBHOOK_PAYMENT_INTENT_FAILED:
-		var pi stripe.PaymentIntent
-		json.Unmarshal(event.Data.Raw, &pi)
-		// h.handlePaymentFailure(pi)
-		h.publishPaymentFailure(ctx, pi.Metadata["order_id"], pi.ID, "payment_intent")
-
-	case WEBHOOK_CHECKOUT_SESSION_COMPLETED:
-		var session stripe.CheckoutSession
-		err := json.Unmarshal(event.Data.Raw, &session)
-		if err != nil {
-			log.Printf("Error parsing webhook JSON: %v\n", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		// Access the metadata directly on the session!
-		orderID := session.Metadata["order_id"]
-		if orderID == "" {
-			log.Println("Critical: checkout.session.completed missing order_id metadata")
-			return
-		}
-
-		// h.handleCOSuccess(session)
-		h.publishPaymentSuccess(ctx, orderID, session.ID, session.AmountTotal, "checkout_session")
-
-	default:
-		// Unhandled event type
-		log.Printf("Unhandled event type: %s\n", event.Type)
+	if err := h.routeAndPublishEvent(ctx, &event); err != nil {
+		log.Printf("❌ Failed to process/publish webhook event %s (%s): %v", event.ID, event.Type, err)
+		// Return 500 so Stripe automatically backs off and retries delivery
+		http.Error(w, "Internal queue error", http.StatusInternalServerError)
+		return
 	}
 
 	// 3. Acknowledge Receipt
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *StripeWebhookHandler) publishPaymentSuccess(ctx context.Context, orderID, txID string, amount int64, source string) {
-	if orderID == "" {
-		log.Printf("Critical: %s event succeeded but missing order_id metadata", source)
-		return
+/**
+ * routeAndPublishEvent: establish event order payload base on the event type webhook
+ * response to send into redis channel. use unified redis event to
+ * process the event order payload base on the @EventType
+ * @param ctx
+ * @param event: webhook event response
+**/
+func (h *StripeWebhookHandler) routeAndPublishEvent(
+	ctx context.Context,
+	event *stripe.Event,
+) error {
+	var orderEvt *OrderEventPayload
+
+	switch event.Type {
+	case WEBHOOK_PAYMENT_INTENT_SUCCESS:
+		var pi stripe.PaymentIntent
+		if err := json.Unmarshal(event.Data.Raw, &pi); err != nil {
+			return fmt.Errorf("unmarshal payment_intent: %w", err)
+		}
+		orderID := pi.Metadata["order_id"]
+		if orderID == "" {
+			log.Printf("⚠️ Warning: payment_intent %s missing order_id metadata", pi.ID)
+			return nil
+		}
+		orderEvt = &OrderEventPayload{
+			EventID:         event.ID,
+			EventType:       EventOrderPaid,
+			OrderID:         orderID,
+			PaymentIntentID: pi.ID,
+			Amount:          pi.Amount,
+			Currency:        string(pi.Currency),
+			Source:          OrderEventSourcePaymentIntent,
+			Timestamp:       time.Now().UTC(),
+		}
+
+	case WEBHOOK_PAYMENT_INTENT_FAILED:
+		var pi stripe.PaymentIntent
+		if err := json.Unmarshal(event.Data.Raw, &pi); err != nil {
+			return fmt.Errorf("unmarshal payment_intent: %w", err)
+		}
+		orderID := pi.Metadata["order_id"]
+		if orderID == "" {
+			log.Printf("⚠️ Warning: payment_intent %s missing order_id metadata", pi.ID)
+			return nil
+		}
+		var failureReason string
+		if pi.LastPaymentError != nil {
+			failureReason = string(pi.LastPaymentError.Code)
+		}
+		orderEvt = &OrderEventPayload{
+			EventID:         event.ID,
+			EventType:       EventOrderFailed,
+			OrderID:         orderID,
+			PaymentIntentID: pi.ID,
+			FailureReason:   failureReason,
+			Source:          OrderEventSourcePaymentIntent,
+			Timestamp:       time.Now().UTC(),
+		}
+
+	case WEBHOOK_CHECKOUT_SESSION_COMPLETED:
+		var session stripe.CheckoutSession
+		if err := json.Unmarshal(event.Data.Raw, &session); err != nil {
+			return fmt.Errorf("unmarshal checkout_session: %w", err)
+		}
+		orderID := session.Metadata["order_id"]
+		if orderID == "" {
+			log.Printf("⚠️ Warning: checkout_session %s missing order_id metadata", session.ID)
+			return nil
+		}
+		var paymentIntentID string
+		if session.PaymentIntent != nil {
+			paymentIntentID = session.PaymentIntent.ID
+		}
+		orderEvt = &OrderEventPayload{
+			EventID:         event.ID,
+			EventType:       EventOrderPaid,
+			OrderID:         orderID,
+			PaymentIntentID: paymentIntentID,
+			Amount:          session.AmountTotal,
+			Currency:        string(session.Currency),
+			Source:          OrderEventSourceCheckoutSession,
+			Timestamp:       time.Now().UTC(),
+		}
+
+	case WEBHOOK_CHARGE_REFUND:
+		var charge stripe.Charge
+		if err := json.Unmarshal(event.Data.Raw, &charge); err != nil {
+			return fmt.Errorf("unmarshal charge: %w", err)
+		}
+		var paymentIntentID string
+		if charge.PaymentIntent != nil {
+			paymentIntentID = charge.PaymentIntent.ID
+		}
+		orderID := charge.Metadata["order_id"]
+		if orderID == "" {
+			log.Printf("⚠️ Warning: charge refund %s missing order_id metadata", event.ID)
+			return nil
+		}
+		orderEvt = &OrderEventPayload{
+			EventID:         event.ID,
+			EventType:       EventOrderRefundSuccess,
+			OrderID:         orderID,
+			PaymentIntentID: paymentIntentID,
+			ChargeID:        charge.ID,
+			AmountRefunded:  charge.AmountRefunded,
+			Currency:        string(charge.Currency),
+			IsPartialRefund: !charge.Refunded,
+			Timestamp:       time.Now().UTC(),
+		}
+
+	case WEBHOOK_REFUND_CREATE, WEBHOOK_REFUND_UPDATED:
+		var ref stripe.Refund
+		if err := json.Unmarshal(event.Data.Raw, &ref); err != nil {
+			return fmt.Errorf("unmarshal refund: %w", err)
+		}
+		var paymentIntentID, chargeID string
+		if ref.PaymentIntent != nil {
+			paymentIntentID = ref.PaymentIntent.ID
+		}
+		if ref.Charge != nil {
+			chargeID = ref.Charge.ID
+		}
+		orderID := ref.Metadata["order_id"]
+		if orderID == "" {
+			log.Printf("⚠️ Warning: charge refund upate event %s missing order_id metadata", event.ID)
+			return nil
+		}
+		failureReason := ""
+		if ref.FailureReason != "" {
+			failureReason = string(ref.FailureReason)
+		}
+		orderEvt = &OrderEventPayload{
+			EventID:         event.ID,
+			EventType:       EventOrderRefundUpdated,
+			OrderID:         orderID,
+			RefundID:        ref.ID,
+			PaymentIntentID: paymentIntentID,
+			ChargeID:        chargeID,
+			Amount:          ref.Amount,
+			Currency:        string(ref.Currency),
+			Status:          string(ref.Status),
+			FailureReason:   failureReason,
+			Timestamp:       time.Now().UTC(),
+		}
+
+	default:
+		log.Printf("Unhandled event type: %s\n", event.Type)
+		return nil
 	}
 
-	payload := OrderEventPayload{
-		EventType:     EventOrderPaid,
-		OrderID:       orderID,
-		TransactionID: txID,
-		Amount:        amount,
-		Source:        source,
+	if orderEvt != nil {
+		return h.publishEvent(ctx, orderEvt)
 	}
 
-	if err := h.redisClient.Publish(ctx, RedisOrderChannel, payload).Err(); err != nil {
-		log.Printf("Failed to publish ORDER_PAID event to Redis for order %s: %v", orderID, err)
-		return
-	}
-
-	log.Printf("Published ORDER_PAID event to Redis for Order: %s", orderID)
+	return nil
 }
 
-func (h *StripeWebhookHandler) publishPaymentFailure(ctx context.Context, orderID, txID, source string) {
-	if orderID == "" {
-		return
+/**
+ * publishEvent: publish event order get from webhook to redis
+ * @param ctx
+ * @param evt: unified event order payload send into redis channel
+ *
+ **/
+func (h *StripeWebhookHandler) publishEvent(ctx context.Context, evt *OrderEventPayload) error {
+	data, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("failed to marshal order event: %w", err)
 	}
 
-	payload := OrderEventPayload{
-		EventType:     EventOrderFailed,
-		OrderID:       orderID,
-		TransactionID: txID,
-		Source:        source,
+	if err := h.redisClient.Publish(ctx, RedisOrderEventsTopic, data).Err(); err != nil {
+		return fmt.Errorf("redis publish failed: %w", err)
 	}
 
-	if err := h.redisClient.Publish(ctx, RedisOrderChannel, payload).Err(); err != nil {
-		log.Printf("Failed to publish ORDER_FAILED event to Redis for order %s: %v", orderID, err)
-		return
-	}
-
-	log.Printf("Published ORDER_FAILED event to Redis for Order: %s", orderID)
-}
-
-func (h *StripeWebhookHandler) handlePaymentSuccess(pi stripe.PaymentIntent) {
-	orderID := pi.Metadata["order_id"]
-	if orderID == "" {
-		log.Printf("Critcal: PaymentIntent %s succeeded but missing order_id metadata", pi.ID)
-		return
-	}
-
-	log.Printf("Payment succeeded for Order: %s. Amount: %d", orderID, pi.Amount)
-
-	// TODO:
-	// 1. Begin Database Transaction
-	// 2. Select Order by ID FOR UPDATE (Lock the row)
-	// 3. If Order is already PAID, return early (Idempotency)
-	// 4. Update Order Status to PAID
-	// 5. Commit Transaction
-	// 6. Publish Event: Produce message to Kafka topic `order.events` (e.g., {"type": "order_paid", "order_id": orderID})
-}
-
-func (h *StripeWebhookHandler) handlePaymentFailure(pi stripe.PaymentIntent) {
-	orderID := pi.Metadata["order_id"]
-	// TODO: Update local database order status to FAILED, release held inventory
-	log.Printf("Payment failed for Order: %s", orderID)
-}
-
-func (h *StripeWebhookHandler) handleCOSuccess(pi stripe.CheckoutSession) {
-
-	orderID := pi.Metadata["order_id"]
-
-	// Now you know the payment is secured by Stripe
-	// Fulfill the order in your DB
-	log.Printf("Fulfilling order %s via checkout session %s", orderID, pi.ID)
-
-	// 1. Start Transaction
-	// 2. SELECT ... FOR UPDATE on Order table by order_id
-	// 3. Verify status != 'PAID' (Idempotency)
-	// 4. UPDATE order status to PAID
-	// 5. Commit Transaction
+	log.Printf("📢 Published [%s] for Order: %s (Stripe Event: %s)",
+		evt.EventType,
+		evt.OrderID,
+		evt.EventID,
+	)
+	return nil
 }

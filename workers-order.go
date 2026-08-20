@@ -58,11 +58,13 @@ func main() {
 	defer cancel()
 
 	// Initialize and start the Order Event Consumer
-	orderConsumer := stripeaym.NewOrderEventConsumer(rdb)
+	orderConsumer := stripeaym.NewOrderEventConsumer(rdb, 0)
 
 	// Run the consumer in a separate goroutine so we can listen for termination signals below
 	go func() {
-		orderConsumer.StartListening(ctx)
+		if err := orderConsumer.Start(ctx); err != nil && err != context.Canceled {
+			log.Printf("Consumer error: %v", err)
+		}
 	}()
 
 	log.Println("👷 Order Worker Process is running and waiting for events...")
