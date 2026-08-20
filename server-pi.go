@@ -8,12 +8,20 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	stripeaym "stripe-aym/pkg/stripe-aym"
 
 	"github.com/joho/godotenv"
 	"github.com/stripe/stripe-go/v86"
 )
+
+type RefundRequest struct {
+	PaymentIntentID string `json:"payment_intent_id"`
+	OrderID         string `json:"order_id"`
+	Reason          string `json:"reason"`
+	Amount          int64  `json:"amount"` // Optional: pass amount dynamically if needed
+}
 
 var sc *stripe.Client
 
@@ -40,6 +48,11 @@ func main() {
 	http.Handle("/", fs)
 	http.HandleFunc("/create-payment-intent", func(w http.ResponseWriter, r *http.Request) {
 		handleCreatePaymentIntent(scService, w, r)
+	})
+
+	// Example trigger for a partial refund
+	http.HandleFunc("/api/refund", func(w http.ResponseWriter, r *http.Request) {
+		makeRefundRequest(scService, w, r)
 	})
 
 	addr := "localhost:4242"
@@ -92,10 +105,10 @@ func handleCreatePaymentIntent(service stripeaym.PII, w http.ResponseWriter, r *
 		TotalCost: stripe.Int64(calculateOrderAmount(req.Items)),
 		ShippingAddress: &stripeaym.ShippingAddress{
 			Country:    "vietnam",
-			City:       "hcmut",
+			City:       "phu yen, daklak",
 			PostalCode: "70000",
 		},
-		OrderID: "sunway-008",
+		OrderID: "sunway-777",
 	}
 	pi, err := service.MakePaymentIntents(&params)
 	if err != nil {
@@ -166,4 +179,44 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 		log.Printf("io.Copy: %v", err)
 		return
 	}
+}
+
+func makeRefundRequest(service stripeaym.PII, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req RefundRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON payload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Validate required fields
+	if req.PaymentIntentID == "" || req.OrderID == "" {
+		http.Error(w, "payment_intent_id and order_id are required", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// Refunding $5.00 (500 cents) partially on a PaymentIntent
+	paymentIntentID := req.PaymentIntentID
+	pirf := &stripeaym.PaymentRefundParams{
+		PaymentIntentId: paymentIntentID,
+		Amount:          500,
+		Reason:          req.Reason,
+		OrderID:         req.OrderID,
+	}
+
+	ref, err := service.IssueRefund(ctx, pirf)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ref)
 }

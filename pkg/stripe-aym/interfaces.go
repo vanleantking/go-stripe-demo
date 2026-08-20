@@ -1,6 +1,10 @@
 package stripeaym
 
-import "github.com/stripe/stripe-go/v86"
+import (
+	"context"
+
+	"github.com/stripe/stripe-go/v86"
+)
 
 type COSessionI interface {
 	MakeCheckoutSessions(
@@ -10,4 +14,5 @@ type COSessionI interface {
 
 type PII interface {
 	MakePaymentIntents(siParams *PaymentIntentParams) (*stripe.PaymentIntent, error)
+	IssueRefund(ctx context.Context, refundParams *PaymentRefundParams) (*stripe.Refund, error)
 }
